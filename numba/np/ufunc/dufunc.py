@@ -10,7 +10,8 @@ from numba.core.extending import (is_jitted, overload_attribute,
                                   overload_method, register_jitable,
                                   intrinsic)
 from numba.core.typing import npydecl
-from numba.core.typing.templates import AbstractTemplate, signature
+from numba.core.typing.templates import (AbstractTemplate, AttributeTemplate,
+                                         signature)
 from numba.cpython.unsafe.tuple import tuple_setitem
 from numba.np.ufunc import _internal
 from numba.np.ufunc.ufunc_base import UfuncBase, UfuncLowererBase
@@ -956,8 +957,30 @@ class DUFunc(serialize.ReduceMixin, _internal._DUFunc, UfuncBase):
                        (AbstractTemplate,),
                        dict(key=self, generic=self._type_me))
         typingctx.insert_user_function(self, _ty_cls)
-        self._install_ufunc_attributes(_ty_cls)
-        self._install_ufunc_methods(_ty_cls)
+        typingctx.insert_attributes(
+            self._lazy_attribute_template(_ty_cls)(typingctx))
+
+    def _lazy_attribute_template(self, ty_cls):
+        """Defer registering the ufunc attribute and method overloads until
+        an attribute is first resolved in jitted code, as registering them
+        is costly and most DUFuncs are never used that way.
+        """
+        installed = False
+
+        def generic_resolve(tmpl, typ, attr):
+            nonlocal installed
+            if installed:
+                return None
+            installed = True
+            self._install_ufunc_attributes(ty_cls)
+            self._install_ufunc_methods(ty_cls)
+            tmpl.context.refresh()
+            return tmpl.context.resolve_getattr(typ, attr)
+
+        return type('DUFuncLazyAttributes_' + self.ufunc.__name__,
+                    (AttributeTemplate,),
+                    dict(key=types.Function(ty_cls),
+                         generic_resolve=generic_resolve))
 
     def find_ewise_function(self, ewise_types):
         """
