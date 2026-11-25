@@ -27,6 +27,7 @@ from numba.core.caching import (
     FunctionCache,
     InTreeCacheLocator,
     InTreeCacheLocatorFsAgnostic,
+    _describe_key_mismatch,
 )
 from numba.core.errors import NumbaWarning, NumbaDeprecationWarning
 from numba.parfors import parfor
@@ -1150,6 +1151,108 @@ class TestCacheWithCpuSetting(DispatcherCacheUsecasesTest):
         self.assertEqual(key_host[1][2], system_features)
         self.assertEqual(key_modified[1][1], cpu_codegen._get_host_cpu_name())
         self.assertEqual(key_modified[1][2], my_cpu_features)
+
+
+class TestDescribeKeyMismatch(TestCase):
+
+    target = ("x86_64-unknown-linux-gnu", "skylake", "+avx,+sse")
+    key = (("float64",), target, ("code", "closure"))
+
+    def describe(self, **changes):
+        sig, target, hashes = self.key
+        stored = (changes.get("sig", sig), changes.get("target", target),
+                  changes.get("hashes", hashes))
+        return _describe_key_mismatch(self.key, {stored: "f.1.nbc"})
+
+    def test_signature(self):
+        self.assertEqual(self.describe(sig=("int64",)),
+                         "signature ('float64',) not cached "
+                         "(cached: ('int64',))")
+
+    def test_cpu(self):
+        target = ("x86_64-unknown-linux-gnu", "znver4", "+avx,+sse")
+        self.assertEqual(self.describe(target=target),
+                         "CPU mismatch: cached 'znver4', running 'skylake'")
+
+    def test_triple(self):
+        target = ("aarch64-unknown-linux-gnu", "skylake", "+avx,+sse")
+        self.assertIn("target triple mismatch", self.describe(target=target))
+
+    def test_cpu_features(self):
+        target = ("x86_64-unknown-linux-gnu", "skylake", "+avx512f,+sse")
+        self.assertEqual(self.describe(target=target),
+                         "CPU features mismatch: cached only {+avx512f}, "
+                         "running only {+avx}")
+
+    def test_bytecode_and_closure(self):
+        self.assertEqual(self.describe(hashes=("other", "closure")),
+                         "function bytecode changed")
+        self.assertEqual(self.describe(hashes=("code", "other")),
+                         "closure variables changed")
+
+    def test_closest_key_is_used(self):
+        cpu = ("x86_64-unknown-linux-gnu", "znver4", "+avx,+sse")
+        stored = {(("int64",), cpu, ("code", "closure")): "f.1.nbc",
+                  (("float64",), cpu, ("code", "closure")): "f.2.nbc"}
+        self.assertEqual(_describe_key_mismatch(self.key, stored),
+                         "CPU mismatch: cached 'znver4', running 'skylake'")
+
+    def test_incompatible_keys(self):
+        self.assertEqual(_describe_key_mismatch(self.key, {("a",): "x"}),
+                         "no compatible entry")
+
+
+class TestCacheMissDiagnostics(DispatcherCacheUsecasesTest):
+    # Disable parallel testing due to envvars modification
+    _numba_parallel_test_ = False
+
+    def call_and_log(self, *args):
+        mod = self.import_module()
+        with capture_cache_log() as out:
+            mod.add_usecase(*args)
+        return out.getvalue()
+
+    def test_locator_logged(self):
+        with capture_cache_log() as out:
+            self.import_module()
+        self.assertIn("using InTreeCacheLocator for 'add_usecase' in %r"
+                      % self.cache_dir, out.getvalue())
+
+    def test_no_index(self):
+        self.assertIn("miss: no index file at", self.call_and_log(2, 3))
+
+    def test_signature_not_cached(self):
+        self.call_and_log(2, 3)
+        self.assertIn("signature (float64, float64) not cached "
+                      "(cached: (int64, int64))", self.call_and_log(2.0, 3.0))
+
+    def test_source_changed(self):
+        self.call_and_log(2, 3)
+        with open(self.modfile, "a") as f:
+            f.write("\n# changed\n")
+        self.assertIn("miss: source file changed", self.call_and_log(2, 3))
+
+    @unittest.skipIf(ll.get_host_cpu_name() == "generic",
+                     "LLVM detected 'generic' CPU")
+    def test_cpu_mismatch(self):
+        self.run_in_separate_process(envvars={'NUMBA_CPU_NAME': 'generic'})
+        self.assertIn("CPU mismatch: cached 'generic', running %r"
+                      % ll.get_host_cpu_name(), self.call_and_log(2, 3))
+
+    @skip_bad_access
+    @unittest.skipIf(os.name == "nt",
+                     "cannot easily make a directory read-only on Windows")
+    def test_non_writable_pycache(self):
+        os.mkdir(self.cache_dir)
+        old_perms = os.stat(self.cache_dir).st_mode
+        os.chmod(self.cache_dir, 0o500)
+        self.addCleanup(os.chmod, self.cache_dir, old_perms)
+        with capture_cache_log() as out:
+            mod = self.import_module()
+        self.addCleanup(shutil.rmtree, mod.add_usecase.stats.cache_path,
+                        ignore_errors=True)
+        self.assertIn("InTreeCacheLocator skipped: cannot write to %r"
+                      % self.cache_dir, out.getvalue())
 
 
 class TestMultiprocessCache(BaseCacheTest):

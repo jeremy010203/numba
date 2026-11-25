@@ -111,6 +111,15 @@ class _CacheLocator(metaclass=ABCMeta):
         # Ensure the directory is writable by trying to write a temporary file
         tempfile.TemporaryFile(dir=path).close()
 
+    def _try_ensure_cache_path(self):
+        try:
+            self.ensure_cache_path()
+        except OSError as e:
+            _cache_log("[cache] %s skipped: cannot write to %r (%s)",
+                       type(self).__name__, self.get_cache_path(), e)
+            return False
+        return True
+
     @abstractmethod
     def get_cache_path(self):
         """
@@ -199,12 +208,8 @@ class _SourceFileBackedLocatorMixin(object):
             # Perhaps a placeholder (e.g. "<ipython-XXX>")
             return
         self = cls(py_func, py_file)
-        try:
-            self.ensure_cache_path()
-        except OSError:
-            # Cannot ensure the cache directory exists or is writable
-            return
-        return self
+        if self._try_ensure_cache_path():
+            return self
 
 
 class UserProvidedCacheLocator(_SourceFileBackedLocatorMixin, _CacheLocator):
@@ -290,12 +295,8 @@ class UserWideCacheLocator(_SourceFileBackedLocatorMixin, _CacheLocator):
             # stop function exit if frozen, since it uses a temp placeholder
             return
         self = cls(py_func, py_file)
-        try:
-            self.ensure_cache_path()
-        except OSError:
-            # Cannot ensure the cache directory exists or is writable
-            return
-        return self
+        if self._try_ensure_cache_path():
+            return self
 
 
 class IPythonCacheLocator(_CacheLocator):
@@ -345,12 +346,8 @@ class IPythonCacheLocator(_CacheLocator):
         ):
             return
         self = cls(py_func, py_file)
-        try:
-            self.ensure_cache_path()
-        except OSError:
-            # Cannot ensure the cache directory exists
-            return
-        return self
+        if self._try_ensure_cache_path():
+            return self
 
 
 class ZipCacheLocator(_SourceFileBackedLocatorMixin, _CacheLocator):
@@ -398,13 +395,10 @@ class ZipCacheLocator(_SourceFileBackedLocatorMixin, _CacheLocator):
     def from_function(cls, py_func, py_file):
         if ".zip" not in py_file:
             return None
-        try:
-            self = cls(py_func, py_file)
-            self.ensure_cache_path()
-        except OSError:
-            # Cannot ensure the cache directory exists or is writable
-            return None
-        return self
+        self = cls(py_func, py_file)
+        if self._try_ensure_cache_path():
+            return self
+        return None
 
 class CacheImpl(metaclass=ABCMeta):
     """
@@ -463,6 +457,8 @@ class CacheImpl(metaclass=ABCMeta):
         else:
             raise RuntimeError("cannot cache function %r: no locator available "
                                "for file %r" % (qualname, source_path))
+        _cache_log("[cache] using %s for %r in %r", type(locator).__name__,
+                   qualname, locator.get_cache_path())
         self._locator = locator
         # Use filename base name as module name to avoid conflict between
         # foo/__init__.py and foo/foo.py
@@ -574,6 +570,48 @@ class CodeLibraryCacheImpl(CacheImpl):
         return '-'.join([self._filename_prefix, res])
 
 
+def _describe_target_mismatch(cached, current):
+    if not (isinstance(cached, tuple) and len(cached) == len(current) == 3):
+        return ["target changed"]
+    reasons = []
+    for name, old, new in zip(("target triple", "CPU"), cached, current):
+        if old != new:
+            reasons.append(f"{name} mismatch: cached {old!r}, running {new!r}")
+    if cached[2] != current[2]:
+        old = set(filter(None, cached[2].split(',')))
+        new = set(filter(None, current[2].split(',')))
+        reasons.append("CPU features mismatch: cached only {%s}, running only "
+                       "{%s}" % (','.join(sorted(old - new)),
+                                 ','.join(sorted(new - old))))
+    return reasons
+
+
+def _describe_key_mismatch(key, stored_keys):
+    """
+    Explain why *key* matches none of *stored_keys*, by comparing it with
+    the closest stored key of the same shape.
+    """
+    candidates = [k for k in stored_keys
+                  if isinstance(k, tuple) and len(k) == len(key)]
+    if not candidates:
+        return "no compatible entry"
+    best = min(candidates, key=lambda k: sum(a != b for a, b in zip(k, key)))
+    reasons = []
+    if best[0] != key[0]:
+        cached = ", ".join(sorted({str(k[0]) for k in candidates}))
+        reasons.append(f"signature {key[0]} not cached (cached: {cached})")
+    if best[1] != key[1]:
+        reasons.extend(_describe_target_mismatch(best[1], key[1]))
+    if best[2] != key[2]:
+        if best[2][0] != key[2][0]:
+            reasons.append("function bytecode changed")
+        if best[2][1] != key[2][1]:
+            reasons.append("closure variables changed")
+    if best[3:] != key[3:]:
+        reasons.append("compiled kernel changed")
+    return "; ".join(reasons)
+
+
 class IndexDataCacheFile(object):
     """
     Implements the logic for the index file and data file used by a cache.
@@ -612,9 +650,12 @@ class IndexDataCacheFile(object):
         """
         Load a cache entry with *key*.
         """
-        overloads = self._load_index()
+        overloads = self._load_index(explain=True)
         data_name = overloads.get(key)
         if data_name is None:
+            if overloads:
+                _cache_log("[cache] miss in %r: %s", self._index_path,
+                           _describe_key_mismatch(key, overloads))
             return
         try:
             return self._load_data(data_name)
@@ -632,17 +673,18 @@ class IndexDataCacheFile(object):
         warnings.warn(msg, NumbaWarning)
         _cache_log("[cache] cache file %r is corrupt; rebuilding", path)
 
-    def _load_index(self):
+    def _load_index(self, explain=False):
         """
         Load the cache index and return it as a dictionary (possibly
         empty if cache is empty or obsolete).
         """
+        log = _cache_log if explain else lambda *args: None
         try:
             with open(self._index_path, "rb") as f:
                 version = pickle.load(f)
                 data = f.read()
         except FileNotFoundError:
-            # Index doesn't exist yet?
+            log("[cache] miss: no index file at %r", self._index_path)
             return {}
         except (EOFError, pickle.UnpicklingError):
             # Index is corrupt or truncated, so rebuild the cache.
@@ -651,6 +693,8 @@ class IndexDataCacheFile(object):
         if version != self._version:
             # This is another version.  Avoid trying to unpickling the
             # rest of the stream, as that may fail.
+            log("[cache] miss: %r was written by numba %s, running %s",
+                self._index_path, version, self._version)
             return {}
         try:
             stamp, overloads = pickle.loads(data)
@@ -662,6 +706,8 @@ class IndexDataCacheFile(object):
         if stamp != self._source_stamp:
             # Cache is not fresh.  Stale data files will be eventually
             # overwritten, since they are numbered in incrementing order.
+            log("[cache] miss: source file changed since %r was written",
+                self._index_path)
             return {}
         else:
             return overloads

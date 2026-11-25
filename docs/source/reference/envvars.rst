@@ -465,7 +465,8 @@ Options for the compilation cache.
 .. envvar:: NUMBA_DEBUG_CACHE
 
    If set to non-zero, print out information about operation of the
-   :ref:`JIT compilation cache <jit-cache>`.
+   :ref:`JIT compilation cache <jit-cache>`, including which cache
+   directory is used and why a cached entry could not be used.
 
 .. envvar:: NUMBA_CACHE_DIR
 
