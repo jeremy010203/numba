@@ -684,6 +684,7 @@ class IndexDataCacheFile(object):
                 version = pickle.load(f)
                 data = f.read()
         except FileNotFoundError:
+            # Index doesn't exist yet?
             log("[cache] miss: no index file at %r", self._index_path)
             return {}
         except (EOFError, pickle.UnpicklingError):
