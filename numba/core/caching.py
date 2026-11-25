@@ -574,6 +574,10 @@ class CodeLibraryCacheImpl(CacheImpl):
 
 
 def _describe_target_mismatch(cached, current):
+    """
+    Return a list of reasons why the *cached* and *current* codegen magic
+    tuples (target triple, CPU name, CPU features) differ.
+    """
     if not (isinstance(cached, tuple) and len(cached) == len(current) == 3):
         return ["target changed"]
     reasons = []
