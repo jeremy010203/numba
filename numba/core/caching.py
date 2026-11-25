@@ -206,10 +206,11 @@ class _SourceFileBackedLocatorMixin(object):
     def from_function(cls, py_func, py_file):
         if not os.path.exists(py_file):
             # Perhaps a placeholder (e.g. "<ipython-XXX>")
-            return
+            return None
         self = cls(py_func, py_file)
         if self._try_ensure_cache_path():
             return self
+        return None
 
 
 class UserProvidedCacheLocator(_SourceFileBackedLocatorMixin, _CacheLocator):
@@ -293,10 +294,11 @@ class UserWideCacheLocator(_SourceFileBackedLocatorMixin, _CacheLocator):
         if not (os.path.exists(py_file) or getattr(sys, 'frozen', False)):
             # Perhaps a placeholder (e.g. "<ipython-XXX>")
             # stop function exit if frozen, since it uses a temp placeholder
-            return
+            return None
         self = cls(py_func, py_file)
         if self._try_ensure_cache_path():
             return self
+        return None
 
 
 class IPythonCacheLocator(_CacheLocator):
@@ -344,10 +346,11 @@ class IPythonCacheLocator(_CacheLocator):
             py_file.startswith("<ipython-")
             or os.path.basename(os.path.dirname(py_file)).startswith("ipykernel_")
         ):
-            return
+            return None
         self = cls(py_func, py_file)
         if self._try_ensure_cache_path():
             return self
+        return None
 
 
 class ZipCacheLocator(_SourceFileBackedLocatorMixin, _CacheLocator):
